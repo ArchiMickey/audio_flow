@@ -63,6 +63,8 @@ class Transformer(nn.Module):
         seq = controls["seq"]  # (b, l, d)
         self_attn_mask = controls["self_attn_mask"]  # (b, t, d)
         cross_attn_mask = controls["cross_attn_mask"]  # (b, l, d)
+        cross_q_pos = controls.get("cross_q_pos")
+        cross_k_pos = controls.get("cross_k_pos")
 
         # Time embedding
         if t.dim() == 0:
@@ -74,7 +76,7 @@ class Transformer(nn.Module):
         x = self.fc_in(x)
 
         for block in self.blocks:
-            x = block(x, c, seq, self.rope, self_attn_mask, cross_attn_mask)
+            x = block(x, c, seq, self.rope, self_attn_mask, cross_attn_mask, cross_q_pos, cross_k_pos)
         
         x = self.fc_out(x)
 

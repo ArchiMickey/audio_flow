@@ -1,0 +1,62 @@
+---
+train_jsonls:
+  - path: "/datasets/jimmy/audio_flow_tts_full/jsonls/tts/train/ljspeech.jsonl"
+    weight: 1.0
+
+validate_train_jsonl:
+  path: "/datasets/jimmy/audio_flow_tts_full/jsonls/tts/train/ljspeech.jsonl"
+  num: 10
+
+validate_test_jsonl:
+  path: "/datasets/jimmy/audio_flow_tts_full/jsonls/tts/test/ljspeech.jsonl"
+  num: 10
+
+sampler:
+    name: StochasticDynamicBatchJsonlSampler
+    max_tokens_per_batch: 2048
+    max_examples_per_batch: 8
+    length_source: h5
+    drop_last: false
+
+dataset:
+    name: FullLatentTTSDataset
+
+model:
+    name: ZeroShotTTSFlowMatcher
+    sigma: 0.0
+    audio_drop_prob: 0.3
+    cond_drop_prob: 0.2
+    frac_lengths_mask: [0.7, 1.0]
+
+base:
+    name: Transformer
+    in_dim: 64
+    dim: &dim 768
+    num_layers: 12
+    num_heads: 24
+    rope_len: 8192
+
+adapter:
+    name: ZeroShotTTSAdapter
+    in_dim: 64
+    speaker_dim: 64
+    dim: *dim
+
+train:
+    device: cuda
+    num_workers: 0
+    precision: "no"
+    optimizer: AdamW
+    lr: 1e-4
+    warm_up_steps: 1000
+    batch_size_per_device: 8
+    test_every_n_steps: 10000
+    demo_every_n_steps: 10000
+    demo_sample:
+        steps: 32
+        cfg_strength: 1.0
+        duplicate_prompt: true
+        seed: 0
+    save_every_n_steps: 100000
+    training_steps: 2000000
+    resume_ckpt_path:

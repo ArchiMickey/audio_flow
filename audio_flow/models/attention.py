@@ -57,6 +57,8 @@ class Block(nn.Module):
         rope: RoPE,
         self_attn_mask: Tensor,
         cross_attn_mask: Tensor,
+        cross_q_pos: Tensor | None = None,
+        cross_k_pos: Tensor | None = None,
     ) -> torch.Tensor:
         r"""Self attention block.
 
@@ -77,7 +79,7 @@ class Block(nn.Module):
         x = x + e[2] * self.self_attn(h, rope, self_attn_mask)
 
         # Cross-attention
-        x = x + self.cross_attn(self.norm3(x), seq, rope, cross_attn_mask)
+        x = x + self.cross_attn(self.norm3(x), seq, rope, cross_attn_mask, cross_q_pos, cross_k_pos)
 
         # FFN
         h = modulate(self.norm3(x), e[3], e[4])
@@ -191,7 +193,9 @@ class CrossAttention(nn.Module):
         x: Tensor, 
         seq: Tensor,
         rope: RoPE,
-        mask: Tensor
+        mask: Tensor,
+        q_pos: Tensor | None = None,
+        k_pos: Tensor | None = None,
     ) -> Tensor:
         r"""Causal self attention.
 
@@ -222,8 +226,15 @@ class CrossAttention(nn.Module):
         v = rearrange(v, 'b l (n h) -> b l n h', h=self.head_dim)  # (b, l, n, h)
         
         # Apply RoPE
-        q = rope(q)  # (b, l, n, h)
-        k = rope(k)  # (b, l, n, h)
+        if q_pos is None:
+            q = rope(q)  # (b, l, n, h)
+        else:
+            q = rope.apply_positions(q, q_pos)
+
+        if k_pos is None:
+            k = rope(k)  # (b, l, n, h)
+        else:
+            k = rope.apply_positions(k, k_pos)
 
         # from IPython import embed; embed(using=False); os._exit(0)
 

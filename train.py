@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from typing import Iterable, Literal
@@ -18,7 +19,7 @@ from torchcfm.conditional_flow_matching import ConditionalFlowMatcher
 from tqdm import tqdm
 
 import wandb
-from audio_flow.samplers.jsonl_sampler import BatchJsonlSampler
+from audio_flow.samplers.jsonl_sampler import BatchJsonlSampler, StochasticDynamicBatchJsonlSampler
 # from audio_flow.datasets.dataset import MetaDataset
 # from audio_flow.encoders.audio.levo_vae import LevoVAE
 
@@ -40,6 +41,13 @@ def train(args) -> None:
     configs = parse_yaml(config_path)
     device = configs["train"]["device"]
     ckpt_path = configs["train"]["resume_ckpt_path"]
+    precision = configs["train"].get("precision", "no")
+    if precision in {"bf16", "bfloat16"}:
+        autocast_context = lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=str(device).startswith("cuda"))
+    elif precision in {"no", "fp32", "float32", None}:
+        autocast_context = nullcontext
+    else:
+        raise ValueError(f"Unsupported precision: {precision}")
 
     # Checkpoints directory
     config_name = Path(config_path).stem
@@ -56,6 +64,7 @@ def train(args) -> None:
     train_dataloader = DataLoader(
         dataset=train_dataset, 
         batch_sampler=batch_sampler,
+        collate_fn=get_collate_fn(configs),
         num_workers=configs["train"]["num_workers"], 
         pin_memory=True,
     )
@@ -64,7 +73,7 @@ def train(args) -> None:
     model = get_model(configs, ckpt_path).to(device)
 
     # VAE for validation
-    vae = load_vae("levo_vae").to(device)
+    vae = load_vae(configs["train"].get("vae_type", "levo_vae")).to(device)
 
     # EMA (optional)
     ema = deepcopy(model).to(device)
@@ -92,20 +101,26 @@ def train(args) -> None:
         data = truncate_latent(data)
         data = to_device(data, device)
 
-        x_real = data["target_latent"]
-        noise = torch.randn_like(x_real)
-
-        # 1.2 Get input and velocity
-        t, xt, ut = fm.sample_location_and_conditional_flow(x0=noise, x1=x_real)
-
         # ------ 2. Training ------
         # 2.1 Forward
         model.train()
-        controls = model.adapter(data)
-        vt = model.base(t=t, x=xt, controls=controls)
+        with autocast_context():
+            if hasattr(model, "compute_loss"):
+                loss_dict = model.compute_loss(data)
+                loss = loss_dict["loss"]
+            else:
+                x_real = data["target_latent"]
+                noise = torch.randn_like(x_real)
 
-        # 2.2 Loss
-        loss = mean_pool((vt - ut) ** 2, data["target_mask"]).mean()
+                # 1.2 Get input and velocity
+                t, xt, ut = fm.sample_location_and_conditional_flow(x0=noise, x1=x_real)
+
+                controls = model.adapter(data)
+                vt = model.base(t=t, x=xt, controls=controls)
+
+                # 2.2 Loss
+                loss = mean_pool((vt - ut) ** 2, data["target_mask"]).mean()
+        loss = loss.float()
 
         # 2.3 Optimize
         optimizer.zero_grad()  # Reset all parameter.grad to 0
@@ -119,10 +134,17 @@ def train(args) -> None:
 
         if step % 100 == 0:
             print("train loss: {:.4f}".format(loss.item()))
+            if wandb_log:
+                log_data = {"train_loss": loss.item()}
+                if scheduler:
+                    log_data["lr"] = scheduler.get_last_lr()[0]
+                else:
+                    log_data["lr"] = optimizer.param_groups[0]["lr"]
+                wandb.log(data=log_data, step=step)
         
         # ------ 3. Evaluation ------
         # 3.1 Evaluate
-        if step % configs["train"]["test_every_n_steps"] == 0:
+        if step % configs["train"]["test_every_n_steps"] == 0 and not getattr(model, "skip_default_validate", False):
 
             for split in ["train", "test"]:
                 validate(
@@ -133,20 +155,27 @@ def train(args) -> None:
                     out_dir=Path("./results", filename, config_name, f"steps={step}_ema"),
                 )
 
-            if wandb_log:
-                wandb.log(
-                    data={
-                        "train_loss": loss.item()
-                    },
-                    step=step
-                )
-        
         # 3.2 Save model
         if step % configs["train"]["save_every_n_steps"] == 0:
-           
-            ckpt_path = Path(ckpts_dir, f"step={step}_ema.pth")
-            torch.save(get_saveable_state_dict(ema), ckpt_path)
-            print(f"Save model to {ckpt_path}")
+            online_ckpt_path = Path(ckpts_dir, f"step={step}.pth")
+            ema_ckpt_path = Path(ckpts_dir, f"step={step}_ema.pth")
+            torch.save(get_saveable_state_dict(model), online_ckpt_path)
+            torch.save(get_saveable_state_dict(ema), ema_ckpt_path)
+            print(f"Save model to {online_ckpt_path}")
+            print(f"Save EMA model to {ema_ckpt_path}")
+
+        demo_every_n_steps = configs["train"].get("demo_every_n_steps", 0)
+        if demo_every_n_steps and step > 0 and step % demo_every_n_steps == 0:
+            demo_dir = Path("./results", filename, config_name, "demo_samples")
+            demo_sample(
+                configs=configs,
+                model=ema,
+                vae=vae,
+                data=data,
+                step=step,
+                out_dir=demo_dir,
+                wandb_log=wandb_log,
+            )
 
         if step == configs["train"]["training_steps"]:
             break
@@ -169,6 +198,10 @@ def get_dataset(configs: dict) -> Dataset:
     elif name == "TTSDataset":
         from audio_flow.datasets.tts import TTSDataset
         return TTSDataset(configs["clip_duration"])
+
+    elif name == "FullLatentTTSDataset":
+        from audio_flow.datasets.tts import FullLatentTTSDataset
+        return FullLatentTTSDataset(configs.get("clip_duration"))
 
     elif name == "TTADataset":
         from audio_flow.datasets.tta import TTADataset
@@ -210,6 +243,16 @@ def get_dataset(configs: dict) -> Dataset:
         raise ValueError(name)
 
 
+def get_collate_fn(configs: dict):
+    name = configs["dataset"]["name"]
+
+    if name == "FullLatentTTSDataset":
+        from audio_flow.datasets.tts import full_latent_tts_collate
+        return full_latent_tts_collate
+
+    return None
+
+
 def get_batch_sampler(configs: dict) -> Iterable:
     r"""Get sampler."""
     name = configs["sampler"]["name"]
@@ -220,6 +263,20 @@ def get_batch_sampler(configs: dict) -> Iterable:
         weights = [meta["weight"] for meta in configs["train_jsonls"]]
         return BatchJsonlSampler(paths, weights, batch_size)
 
+    elif name == "StochasticDynamicBatchJsonlSampler":
+        sampler_configs = configs.get("sampler", {})
+        paths = [meta["path"] for meta in configs["train_jsonls"]]
+        weights = [meta["weight"] for meta in configs["train_jsonls"]]
+        return StochasticDynamicBatchJsonlSampler(
+            jsonl_paths=paths,
+            weights=weights,
+            max_tokens_per_batch=sampler_configs["max_tokens_per_batch"],
+            max_examples_per_batch=sampler_configs.get("max_examples_per_batch", batch_size),
+            drop_last=sampler_configs.get("drop_last", False),
+            length_source=sampler_configs.get("length_source", "metadata"),
+            seed=sampler_configs.get("seed"),
+        )
+
     else:
         raise ValueError(name)
 
@@ -227,12 +284,32 @@ def get_batch_sampler(configs: dict) -> Iterable:
 def get_model(configs: dict, ckpt_path: str) -> nn.Module:
     base = get_base(configs=configs)
     adapter = get_adapter(configs=configs)
-    model = CombinedModel(base, adapter)
+
+    model_configs = configs.get("model", {})
+    model_name = model_configs.get("name", "CombinedModel")
+    if model_name == "CombinedModel":
+        model = CombinedModel(base, adapter)
+    elif model_name == "ZeroShotTTSFlowMatcher":
+        from audio_flow.models.zero_shot_tts import ZeroShotTTSFlowMatcher
+        model = ZeroShotTTSFlowMatcher(base=base, adapter=adapter, **model_configs)
+    else:
+        raise ValueError(model_name)
 
     if ckpt_path:
         ckpt = torch.load(ckpt_path)
+        model_state = model.state_dict()
+        skipped = [
+            key for key, value in ckpt.items()
+            if key in model_state and model_state[key].shape != value.shape
+        ]
+        ckpt = {
+            key: value for key, value in ckpt.items()
+            if key in model_state and model_state[key].shape == value.shape
+        }
         model.load_state_dict(ckpt, strict=False)
         print(f"Load checkpoint from {ckpt_path}")
+        if skipped:
+            print("Skip checkpoint tensors with mismatched shape: {}".format(", ".join(skipped)))
 
     return model
 
@@ -246,6 +323,10 @@ def get_base(
     if name == "Transformer":
         from audio_flow.models.transformer import Transformer
         return Transformer(**configs["base"])
+
+    elif name == "F5StyleCrossAttnTransformer":
+        from audio_flow.models.f5_style_transformer import F5StyleCrossAttnTransformer
+        return F5StyleCrossAttnTransformer(**configs["base"])
 
     else:
         raise ValueError(name)    
@@ -268,6 +349,10 @@ def get_adapter(
     elif name == "TTSAdapter":
         from audio_flow.adapters.tts import TTSAdapter
         return TTSAdapter(**configs["adapter"])
+
+    elif name == "ZeroShotTTSAdapter":
+        from audio_flow.adapters.tts import ZeroShotTTSAdapter
+        return ZeroShotTTSAdapter(**configs["adapter"])
 
     elif name == "TTAAdapter":
         from audio_flow.adapters.tta import TTAAdapter
@@ -329,6 +414,82 @@ def get_optimizer_and_scheduler(
         scheduler = None
 
     return optimizer, scheduler
+
+
+@torch.no_grad()
+def demo_sample(
+    configs: dict,
+    model: nn.Module,
+    vae: nn.Module,
+    data: dict,
+    step: int,
+    out_dir: Path,
+    wandb_log: bool = False,
+) -> None:
+    r"""Write a short training-time demo sample for zero-shot TTS models."""
+
+    if not hasattr(model, "sample"):
+        return
+
+    demo_configs = configs["train"].get("demo_sample", {})
+    sample_index = demo_configs.get("sample_index", 0)
+    steps = demo_configs.get("steps", 32)
+    cfg_strength = demo_configs.get("cfg_strength", 1.0)
+    sway_sampling_coef = demo_configs.get("sway_sampling_coef")
+    seed = demo_configs.get("seed")
+    no_ref_audio = demo_configs.get("no_ref_audio", False)
+    duplicate_prompt = demo_configs.get("duplicate_prompt", True)
+
+    if sample_index >= data["target_latent"].shape[0]:
+        sample_index = 0
+
+    device = next(model.parameters()).device
+    ref_len = int(data["target_length"][sample_index].item())
+    ref_latent = data["target_latent"][sample_index : sample_index + 1, :ref_len]
+    prompt = data["prompt"][sample_index]
+    infer_prompt = f"{prompt} {prompt}" if duplicate_prompt else prompt
+
+    previous_training = model.training
+    model.eval()
+    generated = model.sample(
+        cond_latent=ref_latent,
+        prompt=[infer_prompt],
+        duration=ref_len * 2,
+        lens=torch.tensor([ref_len], device=device),
+        steps=steps,
+        cfg_strength=cfg_strength,
+        sway_sampling_coef=sway_sampling_coef,
+        seed=seed,
+        no_ref_audio=no_ref_audio,
+    )
+
+    generated = generated.to(device)
+    gen_latent = generated[:, ref_len:, :]
+    ref_audio = vae.decode(ref_latent).data.cpu().numpy()[0]
+    gen_audio = vae.decode(gen_latent).data.cpu().numpy()[0]
+    full_audio = vae.decode(generated).data.cpu().numpy()[0]
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    gen_path = Path(out_dir, f"step={step}_gen.wav")
+    ref_path = Path(out_dir, f"step={step}_ref.wav")
+    full_path = Path(out_dir, f"step={step}_ref_gen.wav")
+
+    soundfile.write(file=gen_path, data=gen_audio.T, samplerate=vae.sr)
+    soundfile.write(file=ref_path, data=ref_audio.T, samplerate=vae.sr)
+    soundfile.write(file=full_path, data=full_audio.T, samplerate=vae.sr)
+    print(f"Write demo samples to {out_dir}")
+
+    if wandb_log:
+        wandb.log(
+            data={
+                "demo/gen": wandb.Audio(str(gen_path), sample_rate=vae.sr),
+                "demo/ref": wandb.Audio(str(ref_path), sample_rate=vae.sr),
+            },
+            step=step,
+        )
+
+    if previous_training:
+        model.train()
 
 
 def validate(

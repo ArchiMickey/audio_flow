@@ -17,6 +17,7 @@ class RoPE(nn.Module):
         super().__init__()
 
         self.head_dim = head_dim
+        self.base = base
 
         # Calculate θ = 1 / 10000**(2i/h)
         theta = 1.0 / (base ** (torch.arange(0, head_dim, 2) / head_dim))  # (h/2,)
@@ -48,6 +49,26 @@ class RoPE(nn.Module):
         x = self.rotate(x, w)  # (b, l, n, h/2, 2)
         x = rearrange(x, 'b l n h c -> b l n (h c)')  # (b, l, n, h)
         
+        return x
+
+    def apply_positions(self, x: Tensor, pos: Tensor) -> Tensor:
+        r"""Apply RoPE with explicit possibly-fractional positions.
+
+        Args:
+            x: (b, l, n, h)
+            pos: (b, l) or (l,), positions in RoPE time units
+        """
+
+        if pos.dim() == 1:
+            pos = pos[None, :].expand(x.shape[0], -1)
+
+        theta = 1.0 / (self.base ** (torch.arange(0, self.head_dim, 2, device=x.device) / self.head_dim))
+        pos_theta = pos.to(device=x.device, dtype=theta.dtype)[:, :, None] * theta[None, None, :]
+        w = torch.stack([torch.cos(pos_theta), torch.sin(pos_theta)], dim=-1)[:, :, None, :, :]
+
+        x = rearrange(x, 'b l n (h c) -> b l n h c', c=2)
+        x = self.rotate(x, w)
+        x = rearrange(x, 'b l n h c -> b l n (h c)')
         return x
 
     def rotate(self, x: Tensor, w: Tensor) -> Tensor:

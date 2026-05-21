@@ -1,0 +1,66 @@
+---
+train_jsonls:
+  - path: "/datasets/jimmy/audio_flow_tts_libritts_architts_vae_mean/jsonls/tts/train/libritts.jsonl"
+    weight: 1.0
+
+validate_train_jsonl:
+  path: "/datasets/jimmy/audio_flow_tts_libritts_architts_vae_mean/jsonls/tts/train/libritts.jsonl"
+  num: 10
+
+validate_test_jsonl:
+  path: "/datasets/jimmy/audio_flow_tts_libritts_architts_vae_mean/jsonls/tts/test/libritts.jsonl"
+  num: 10
+
+sampler:
+    name: StochasticDynamicBatchJsonlSampler
+    max_tokens_per_batch: 2048
+    max_examples_per_batch: 16
+    length_source: metadata
+    drop_last: false
+
+dataset:
+    name: FullLatentTTSDataset
+
+model:
+    name: ZeroShotTTSFlowMatcher
+    sigma: 0.0
+    audio_drop_prob: 0.3
+    cond_drop_prob: 0.2
+    frac_lengths_mask: [0.7, 1.0]
+
+base:
+    name: F5StyleCrossAttnTransformer
+    in_dim: 64
+    speaker_dim: 256
+    dim: &dim 768
+    num_layers: 12
+    num_heads: 12
+    rope_len: 8192
+    zero_init_output: true
+
+adapter:
+    name: ZeroShotTTSAdapter
+    in_dim: 64
+    speaker_dim: 256
+    text_dim: 512
+    dim: *dim
+
+train:
+    device: cuda
+    vae_type: architts_vae_24khz_f1920c64_1.0
+    num_workers: 0
+    precision: "bf16"
+    optimizer: AdamW
+    lr: 1e-4
+    warm_up_steps: 1000
+    batch_size_per_device: 16
+    test_every_n_steps: 10000
+    demo_every_n_steps: 10000
+    demo_sample:
+        steps: 32
+        cfg_strength: 1.0
+        duplicate_prompt: true
+        seed: 0
+    save_every_n_steps: 50000
+    training_steps: 2000000
+    resume_ckpt_path:

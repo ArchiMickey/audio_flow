@@ -1,5 +1,5 @@
 import torch.nn as nn
-from einops import rearrange
+import torch.nn.functional as F
 from torch import Tensor
 import torch
 
@@ -10,9 +10,18 @@ from audio_flow.adapters.convnext import ConvNeXt
 from audio_flow.utils import mean_pool, check_masks_type
 
 
+def masked_mean(x: Tensor, mask: Tensor, keepdims: bool = False) -> Tensor:
+    denom = mask.sum(dim=1, keepdim=True).clamp(min=1)
+    out = (x * mask[:, :, None]).sum(dim=1) / denom
+    if keepdims:
+        out = out[:, None, :]
+    return out
+
+
 class TTSAdapter(nn.Module): 
-    def __init__(self, dim: int, **kwargs):
+    def __init__(self, dim: int, text_dim: int | None = None, **kwargs):
         super().__init__()
+        text_dim = text_dim or dim
 
         # T5
         self.t5 = T5()
@@ -20,8 +29,10 @@ class TTSAdapter(nn.Module):
 
         # Character encoder
         self.char_encoder = CharEncoder()
-        self.char_embedder = nn.Embedding(self.char_encoder.vocab_size, dim)
-        self.char_conv = ConvNeXt(dim)
+        self.char_embedder = nn.Embedding(self.char_encoder.vocab_size, text_dim)
+        self.char_conv = ConvNeXt(text_dim)
+        self.text_norm = nn.LayerNorm(text_dim)
+        self.text_fc = nn.Linear(text_dim, dim)
 
     def forward(self, data: dict) -> Tensor:
 
@@ -33,7 +44,12 @@ class TTSAdapter(nn.Module):
         # Prompt
         prompt, prompt_mask = self.char_encoder(data["prompt"])  # (b, l_text, d), (b, l_text)
         prompt = self.char_embedder(prompt)  # (b, l_text, d)
-        prompt = self.char_conv(prompt)
+        prompt = self.char_conv(prompt, prompt_mask)
+        prompt = self.text_norm(prompt)
+        prompt = prompt.masked_fill(~prompt_mask[:, :, None], 0.0)
+        prompt = self.text_fc(prompt)
+        prompt = prompt.masked_fill(~prompt_mask[:, :, None], 0.0)
+        text_cond = masked_mean(prompt, prompt_mask, keepdims=True)
 
         # Build mask
         target_mask = data["target_mask"]  # (b, l_q)
@@ -41,7 +57,7 @@ class TTSAdapter(nn.Module):
         cross_attn_mask = prompt_mask[:, None, None, :] * target_mask[:, None, :, None]  # (b, 1, l_q, l_v)
         assert check_masks_type([self_attn_mask, cross_attn_mask], torch.bool)
 
-        c = task  # (b, 1, d) | (b, l, d)
+        c = task + text_cond  # Added to timestep embedding in DiT before AdaLN.
         seq = prompt  # (b, l, d)
 
         controls = {
@@ -52,3 +68,112 @@ class TTSAdapter(nn.Module):
         }
 
         return controls 
+
+
+class ZeroShotTTSAdapter(nn.Module):
+    r"""Condition TTS generation on text and reference speech latents.
+
+    This adapter is intended for F5-TTS-style infilling training. The training
+    objective provides `cond_latent`, which is the target speech latent with a
+    random span zeroed out. The unmasked latent frames act as the reference
+    speech prompt.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        dim: int,
+        speaker_dim: int | None = None,
+        text_dim: int | None = None,
+        **kwargs,
+    ):
+        super().__init__()
+        speaker_dim = speaker_dim or in_dim
+        text_dim = text_dim or dim
+
+        # T5 task encoder
+        self.t5 = T5()
+        self.t5_fc = nn.Linear(self.t5.dim, dim)
+
+        # Character encoder for transcript text
+        self.char_encoder = CharEncoder()
+        self.char_embedder = nn.Embedding(self.char_encoder.vocab_size, text_dim)
+        self.char_conv = ConvNeXt(text_dim)
+        self.text_norm = nn.LayerNorm(text_dim)
+        self.text_fc = nn.Linear(text_dim, dim)
+
+        self.speaker_embed = nn.Parameter(torch.randn(1, 1, speaker_dim) * 0.02)
+
+    def forward(
+        self,
+        data: dict,
+        drop_audio_cond: bool = False,
+        drop_spk_cond: bool | None = None,
+        drop_text: bool = False,
+    ) -> dict:
+        if drop_spk_cond is None:
+            drop_spk_cond = drop_audio_cond
+
+        # Task
+        task, task_mask = self.t5(data["task"])
+        task = self.t5_fc(task)
+        task = mean_pool(task, task_mask, keepdims=True)
+
+        target_mask = data["target_mask"]
+
+        # Reference speech prompt
+        cond_latent = data["cond_latent"]
+        if drop_audio_cond:
+            cond_latent = torch.zeros_like(cond_latent)
+        input_cond = cond_latent
+        spk_embed = F.normalize(self.speaker_embed, dim=-1)
+        spk_embed = spk_embed.expand(target_mask.shape[0], target_mask.shape[1], -1)
+        if drop_spk_cond:
+            spk_embed = torch.zeros_like(spk_embed)
+        spk_embed = spk_embed.masked_fill(~target_mask[:, :, None], 0.0)
+
+        # Transcript prompt
+        prompt_ids, prompt_mask = self.char_encoder(data["prompt"])
+        prompt = self.char_embedder(prompt_ids)
+        prompt = self.char_conv(prompt, prompt_mask)
+        prompt = self.text_norm(prompt)
+        prompt = prompt.masked_fill(~prompt_mask[:, :, None], 0.0)
+        prompt = self.text_fc(prompt)
+        prompt = prompt.masked_fill(~prompt_mask[:, :, None], 0.0)
+        if drop_text:
+            prompt = torch.zeros_like(prompt)
+            prompt_mask = torch.zeros_like(prompt_mask)
+        text_cond = masked_mean(prompt, prompt_mask, keepdims=True)
+
+        seq = prompt
+        seq_mask = prompt_mask
+
+        self_attn_mask = target_mask[:, None, None, :] * target_mask[:, None, :, None]
+        cross_attn_mask = seq_mask[:, None, None, :] * target_mask[:, None, :, None]
+        assert check_masks_type([self_attn_mask, cross_attn_mask], torch.bool)
+
+        B, target_len = target_mask.shape
+        text_len = prompt_mask.shape[1]
+        device = target_mask.device
+        dtype = prompt.dtype
+        target_lengths = target_mask.sum(dim=1).clamp(min=1).to(dtype)
+        prompt_lengths = prompt_mask.sum(dim=1).clamp(min=1).to(dtype)
+        audio_last_pos = (target_lengths - 1).clamp(min=0)
+        text_denominator = (prompt_lengths - 1).clamp(min=1)
+
+        audio_pos = torch.arange(target_len, device=device, dtype=dtype)[None, :].expand(B, -1)
+        text_unit = audio_last_pos[:, None] / text_denominator[:, None]
+        text_pos = torch.arange(text_len, device=device, dtype=dtype)[None, :] * text_unit
+        text_pos = text_pos.masked_fill(~prompt_mask, 0.0)
+        cross_k_pos = text_pos
+
+        return {
+            "c": task + text_cond,
+            "seq": seq,
+            "self_attn_mask": self_attn_mask,
+            "cross_attn_mask": cross_attn_mask,
+            "cross_q_pos": audio_pos,
+            "cross_k_pos": cross_k_pos,
+            "input_cond": input_cond,
+            "spk_embed": spk_embed,
+        }
