@@ -60,6 +60,7 @@ class StochasticDynamicBatchJsonlSampler:
         jsonl_paths: list[str],
         weights: list[float] | None = None,
         max_tokens_per_batch: int = 2048,
+        max_samples_per_batch: int | None = None,
         max_examples_per_batch: int | None = None,
         drop_last: bool = False,
         length_source: str = "metadata",
@@ -67,15 +68,22 @@ class StochasticDynamicBatchJsonlSampler:
     ):
         if max_tokens_per_batch <= 0:
             raise ValueError(f"`max_tokens_per_batch` must be positive, got {max_tokens_per_batch}.")
-        if max_examples_per_batch is not None and max_examples_per_batch <= 0:
-            raise ValueError(f"`max_examples_per_batch` must be positive, got {max_examples_per_batch}.")
+        if max_samples_per_batch is None:
+            max_samples_per_batch = max_examples_per_batch
+        elif max_examples_per_batch is not None and max_examples_per_batch != max_samples_per_batch:
+            raise ValueError(
+                "`max_samples_per_batch` and deprecated `max_examples_per_batch` "
+                "must match when both are set."
+            )
+        if max_samples_per_batch is not None and max_samples_per_batch <= 0:
+            raise ValueError(f"`max_samples_per_batch` must be positive, got {max_samples_per_batch}.")
         if length_source not in {"metadata", "h5"}:
             raise ValueError(f"`length_source` must be 'metadata' or 'h5', got {length_source}.")
 
         self.jsonl_paths = jsonl_paths
         self.weights = weights or [1.0 for _ in jsonl_paths]
         self.max_tokens_per_batch = max_tokens_per_batch
-        self.max_examples_per_batch = max_examples_per_batch
+        self.max_samples_per_batch = max_samples_per_batch
         self.drop_last = drop_last
         self.length_source = length_source
         self.seed = seed
@@ -116,12 +124,12 @@ class StochasticDynamicBatchJsonlSampler:
         for idx in indices:
             length = lengths[idx]
             exceeds_tokens = batch and num_tokens + length > self.max_tokens_per_batch
-            exceeds_examples = (
-                self.max_examples_per_batch is not None
-                and len(batch) >= self.max_examples_per_batch
+            exceeds_samples = (
+                self.max_samples_per_batch is not None
+                and len(batch) >= self.max_samples_per_batch
             )
 
-            if exceeds_tokens or exceeds_examples:
+            if exceeds_tokens or exceeds_samples:
                 batches.append(batch)
                 batch = []
                 num_tokens = 0
@@ -180,12 +188,12 @@ class GroupedLengthBatchJsonlSampler(StochasticDynamicBatchJsonlSampler):
         for idx in indices:
             length = lengths[idx]
             exceeds_tokens = batch and num_tokens + length > self.max_tokens_per_batch
-            exceeds_examples = (
-                self.max_examples_per_batch is not None
-                and len(batch) >= self.max_examples_per_batch
+            exceeds_samples = (
+                self.max_samples_per_batch is not None
+                and len(batch) >= self.max_samples_per_batch
             )
 
-            if exceeds_tokens or exceeds_examples:
+            if exceeds_tokens or exceeds_samples:
                 batches.append(batch)
                 batch = []
                 num_tokens = 0

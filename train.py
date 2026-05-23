@@ -275,7 +275,10 @@ def get_batch_sampler(configs: dict) -> Iterable:
             jsonl_paths=paths,
             weights=weights,
             max_tokens_per_batch=sampler_configs["max_tokens_per_batch"],
-            max_examples_per_batch=sampler_configs.get("max_examples_per_batch", batch_size),
+            max_samples_per_batch=sampler_configs.get(
+                "max_samples_per_batch",
+                sampler_configs.get("max_examples_per_batch", batch_size),
+            ),
             drop_last=sampler_configs.get("drop_last", False),
             length_source=sampler_configs.get("length_source", "metadata"),
             seed=sampler_configs.get("seed"),
@@ -289,7 +292,10 @@ def get_batch_sampler(configs: dict) -> Iterable:
             jsonl_paths=paths,
             weights=weights,
             max_tokens_per_batch=sampler_configs["max_tokens_per_batch"],
-            max_examples_per_batch=sampler_configs.get("max_examples_per_batch", batch_size),
+            max_samples_per_batch=sampler_configs.get(
+                "max_samples_per_batch",
+                sampler_configs.get("max_examples_per_batch", batch_size),
+            ),
             drop_last=sampler_configs.get("drop_last", False),
             length_source=sampler_configs.get("length_source", "metadata"),
             seed=sampler_configs.get("seed"),
