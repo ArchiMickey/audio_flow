@@ -154,3 +154,49 @@ class StochasticDynamicBatchJsonlSampler:
 
         with h5py.File(audio_meta["latent_path"], "r") as hf:
             return int(hf["latent"].shape[0])
+
+
+class GroupedLengthBatchJsonlSampler(StochasticDynamicBatchJsonlSampler):
+    r"""Length-grouped dynamic batch sampler for JSONL metadata.
+
+    Examples are sorted by latent length before greedy batching, so samples in
+    the same batch have similar durations and require less padding after
+    collation. Batch order is shuffled every epoch, but batch composition is
+    length-grouped instead of globally stochastic.
+    """
+
+    def build_epoch_batches(
+        self,
+        metas: list[dict],
+        lengths: list[int],
+        rng: random.Random,
+    ) -> list[list[dict]]:
+        indices = sorted(range(len(metas)), key=lambda idx: lengths[idx])
+
+        batches = []
+        batch = []
+        num_tokens = 0
+
+        for idx in indices:
+            length = lengths[idx]
+            exceeds_tokens = batch and num_tokens + length > self.max_tokens_per_batch
+            exceeds_examples = (
+                self.max_examples_per_batch is not None
+                and len(batch) >= self.max_examples_per_batch
+            )
+
+            if exceeds_tokens or exceeds_examples:
+                batches.append(batch)
+                batch = []
+                num_tokens = 0
+
+            batch.append(metas[idx])
+            num_tokens += length
+
+        if batch and not self.drop_last:
+            batches.append(batch)
+
+        rng.shuffle(batches)
+        for batch in batches:
+            rng.shuffle(batch)
+        return batches

@@ -12,7 +12,7 @@ validate_test_jsonl:
   num: 10
 
 sampler:
-    name: StochasticDynamicBatchJsonlSampler
+    name: GroupedLengthBatchJsonlSampler
     max_tokens_per_batch: 2048
     max_examples_per_batch: 8
     length_source: metadata

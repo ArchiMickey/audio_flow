@@ -19,7 +19,11 @@ from torchcfm.conditional_flow_matching import ConditionalFlowMatcher
 from tqdm import tqdm
 
 import wandb
-from audio_flow.samplers.jsonl_sampler import BatchJsonlSampler, StochasticDynamicBatchJsonlSampler
+from audio_flow.samplers.jsonl_sampler import (
+    BatchJsonlSampler,
+    GroupedLengthBatchJsonlSampler,
+    StochasticDynamicBatchJsonlSampler,
+)
 # from audio_flow.datasets.dataset import MetaDataset
 # from audio_flow.encoders.audio.levo_vae import LevoVAE
 
@@ -268,6 +272,20 @@ def get_batch_sampler(configs: dict) -> Iterable:
         paths = [meta["path"] for meta in configs["train_jsonls"]]
         weights = [meta["weight"] for meta in configs["train_jsonls"]]
         return StochasticDynamicBatchJsonlSampler(
+            jsonl_paths=paths,
+            weights=weights,
+            max_tokens_per_batch=sampler_configs["max_tokens_per_batch"],
+            max_examples_per_batch=sampler_configs.get("max_examples_per_batch", batch_size),
+            drop_last=sampler_configs.get("drop_last", False),
+            length_source=sampler_configs.get("length_source", "metadata"),
+            seed=sampler_configs.get("seed"),
+        )
+
+    elif name == "GroupedLengthBatchJsonlSampler":
+        sampler_configs = configs.get("sampler", {})
+        paths = [meta["path"] for meta in configs["train_jsonls"]]
+        weights = [meta["weight"] for meta in configs["train_jsonls"]]
+        return GroupedLengthBatchJsonlSampler(
             jsonl_paths=paths,
             weights=weights,
             max_tokens_per_batch=sampler_configs["max_tokens_per_batch"],
