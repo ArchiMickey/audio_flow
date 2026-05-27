@@ -88,7 +88,7 @@ class ZeroShotTTSAdapter(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        speaker_dim = speaker_dim or in_dim
+        speaker_dim = speaker_dim or 0
         text_dim = text_dim or dim
 
         # T5 task encoder
@@ -102,7 +102,9 @@ class ZeroShotTTSAdapter(nn.Module):
         self.text_norm = nn.LayerNorm(text_dim)
         self.text_fc = nn.Linear(text_dim, dim)
 
-        self.speaker_embed = nn.Parameter(torch.randn(1, 1, speaker_dim) * 0.02)
+        self.learned_speaker_dim = speaker_dim
+        if speaker_dim:
+            self.speaker_embed = nn.Parameter(torch.randn(1, 1, speaker_dim) * 0.02)
 
     def forward(
         self,
@@ -126,11 +128,13 @@ class ZeroShotTTSAdapter(nn.Module):
         if drop_audio_cond:
             cond_latent = torch.zeros_like(cond_latent)
         input_cond = cond_latent
-        spk_embed = F.normalize(self.speaker_embed, dim=-1)
-        spk_embed = spk_embed.expand(target_mask.shape[0], target_mask.shape[1], -1)
-        if drop_spk_cond:
-            spk_embed = torch.zeros_like(spk_embed)
-        spk_embed = spk_embed.masked_fill(~target_mask[:, :, None], 0.0)
+        spk_embed = None
+        if self.learned_speaker_dim:
+            spk_embed = F.normalize(self.speaker_embed, dim=-1)
+            spk_embed = spk_embed.expand(target_mask.shape[0], target_mask.shape[1], -1)
+            if drop_spk_cond:
+                spk_embed = torch.zeros_like(spk_embed)
+            spk_embed = spk_embed.masked_fill(~target_mask[:, :, None], 0.0)
 
         # Transcript prompt
         prompt_ids, prompt_mask = self.char_encoder(data["prompt"])
@@ -167,7 +171,7 @@ class ZeroShotTTSAdapter(nn.Module):
         text_pos = text_pos.masked_fill(~prompt_mask, 0.0)
         cross_k_pos = text_pos
 
-        return {
+        controls = {
             "c": task + text_cond,
             "seq": seq,
             "self_attn_mask": self_attn_mask,
@@ -175,5 +179,75 @@ class ZeroShotTTSAdapter(nn.Module):
             "cross_q_pos": audio_pos,
             "cross_k_pos": cross_k_pos,
             "input_cond": input_cond,
-            "spk_embed": spk_embed,
         }
+        if spk_embed is not None:
+            controls["spk_embed"] = spk_embed
+        return controls
+
+
+class ZeroShotTTSSpeakerAdapter(ZeroShotTTSAdapter):
+    r"""Zero-shot TTS adapter with utterance-level speaker embedding concat.
+
+    The speaker embedding is repeated to the audio latent length and passed as
+    `controls["input_speaker"]`, so the DiT input projection can consume
+    `[x_t, input_cond, input_speaker]` frame by frame.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        dim: int,
+        text_dim: int | None = None,
+        speaker_dim: int = 256,
+        speaker_embedding_key: str = "speaker_embedding",
+        **kwargs,
+    ):
+        super().__init__(in_dim=in_dim, dim=dim, speaker_dim=None, text_dim=text_dim, **kwargs)
+        self.speaker_dim = speaker_dim
+        self.speaker_embedding_key = speaker_embedding_key
+
+    def forward(
+        self,
+        data: dict,
+        drop_audio_cond: bool = False,
+        drop_spk_cond: bool | None = None,
+        drop_text: bool = False,
+    ) -> dict:
+        if drop_spk_cond is None:
+            drop_spk_cond = drop_audio_cond
+        controls = super().forward(
+            data,
+            drop_audio_cond=drop_audio_cond,
+            drop_spk_cond=drop_spk_cond,
+            drop_text=drop_text,
+        )
+
+        if self.speaker_embedding_key not in data:
+            raise KeyError(
+                f"`{self.speaker_embedding_key}` is required by ZeroShotTTSSpeakerAdapter. "
+                "Set dataset.speaker_embedding_root in the config or pass the tensor during sampling."
+            )
+
+        speaker_embedding = data[self.speaker_embedding_key].to(
+            device=data["target_mask"].device,
+            dtype=controls["input_cond"].dtype,
+        )
+        if speaker_embedding.dim() != 2:
+            raise ValueError(
+                f"`{self.speaker_embedding_key}` must have shape (B, D), "
+                f"got {tuple(speaker_embedding.shape)}."
+            )
+        if speaker_embedding.shape[-1] != self.speaker_dim:
+            raise ValueError(
+                f"`{self.speaker_embedding_key}` dim mismatch: expected {self.speaker_dim}, "
+                f"got {speaker_embedding.shape[-1]}."
+            )
+
+        target_mask = data["target_mask"]
+        input_speaker = speaker_embedding[:, None, :].expand(-1, target_mask.shape[1], -1)
+        input_speaker = input_speaker.masked_fill(~target_mask[:, :, None], 0.0)
+        if drop_spk_cond:
+            input_speaker = torch.zeros_like(input_speaker)
+
+        controls["input_speaker"] = input_speaker
+        return controls

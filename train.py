@@ -205,7 +205,12 @@ def get_dataset(configs: dict) -> Dataset:
 
     elif name == "FullLatentTTSDataset":
         from audio_flow.datasets.tts import FullLatentTTSDataset
-        return FullLatentTTSDataset(configs.get("clip_duration"))
+        dataset_configs = configs.get("dataset", {})
+        return FullLatentTTSDataset(
+            clip_duration=configs.get("clip_duration"),
+            speaker_embedding_root=dataset_configs.get("speaker_embedding_root"),
+            require_speaker_embedding=dataset_configs.get("require_speaker_embedding", False),
+        )
 
     elif name == "TTADataset":
         from audio_flow.datasets.tta import TTADataset
@@ -378,6 +383,10 @@ def get_adapter(
         from audio_flow.adapters.tts import ZeroShotTTSAdapter
         return ZeroShotTTSAdapter(**configs["adapter"])
 
+    elif name == "ZeroShotTTSSpeakerAdapter":
+        from audio_flow.adapters.tts import ZeroShotTTSSpeakerAdapter
+        return ZeroShotTTSSpeakerAdapter(**configs["adapter"])
+
     elif name == "TTAAdapter":
         from audio_flow.adapters.tta import TTAAdapter
         return TTAAdapter(**configs["adapter"])
@@ -472,10 +481,14 @@ def demo_sample(
     ref_latent = data["target_latent"][sample_index : sample_index + 1, :ref_len]
     prompt = data["prompt"][sample_index]
     infer_prompt = f"{prompt} {prompt}" if duplicate_prompt else prompt
+    sample_data = {}
+    if "speaker_embedding" in data:
+        sample_data["speaker_embedding"] = data["speaker_embedding"][sample_index : sample_index + 1]
 
     previous_training = model.training
     model.eval()
     generated = model.sample(
+        data=sample_data,
         cond_latent=ref_latent,
         prompt=[infer_prompt],
         duration=ref_len * 2,

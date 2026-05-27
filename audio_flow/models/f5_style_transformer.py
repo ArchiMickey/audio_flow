@@ -62,9 +62,8 @@ class F5StyleCrossAttnTransformer(nn.Module):
 
     This keeps the existing zero-shot TTS adapter contract for text/reference
     cross-attention and fractional RoPE positions. The audio stream consumes
-    noised audio `x`, masked conditioning audio `controls["input_cond"]`, and
-    normalized speaker embedding `controls["spk_embed"]`, then uses final AdaLN
-    and zero-initialized output projection.
+    noised audio `x` and masked conditioning audio `controls["input_cond"]`,
+    then uses final AdaLN and zero-initialized output projection.
     """
 
     def __init__(
@@ -74,14 +73,14 @@ class F5StyleCrossAttnTransformer(nn.Module):
         mlp_ratio: float = 4.0,
         num_layers: int = 12,
         num_heads: int = 12,
+        speaker_dim: int = 0,
         rope_len: int = 8192,
-        speaker_dim: int | None = None,
         zero_init_output: bool = True,
         **kwargs,
     ):
         super().__init__()
-        speaker_dim = speaker_dim or in_dim
 
+        self.speaker_dim = speaker_dim
         self.fc_in = nn.Linear(in_dim * 2 + speaker_dim, dim)
 
         self.t_embedder = F5TimestepEmbedding(dim=dim, freq_embed_dim=256)
@@ -122,21 +121,31 @@ class F5StyleCrossAttnTransformer(nn.Module):
                 input_cond = nn.functional.pad(input_cond, (0, 0, 0, x.shape[1] - input_cond.shape[1]))
             input_cond = input_cond[:, : x.shape[1], :]
 
-        spk_embed = controls.get("spk_embed")
-        if spk_embed is None:
-            spk_embed = x.new_zeros(x.shape[0], x.shape[1], self.fc_in.in_features - x.shape[-1] - input_cond.shape[-1])
-        else:
-            spk_embed = spk_embed.to(device=x.device, dtype=x.dtype)
-            if spk_embed.shape[1] < x.shape[1]:
-                spk_embed = nn.functional.pad(spk_embed, (0, 0, 0, x.shape[1] - spk_embed.shape[1]))
-            spk_embed = spk_embed[:, : x.shape[1], :]
+        input_speaker = controls.get("input_speaker")
+        if input_speaker is None:
+            input_speaker = controls.get("spk_embed")
+        if self.speaker_dim:
+            if input_speaker is None:
+                raise KeyError(
+                    "F5StyleCrossAttnTransformer was configured with speaker_dim but controls lack "
+                    "input_speaker/spk_embed."
+                )
+            input_speaker = input_speaker.to(device=x.device, dtype=x.dtype)
+            if input_speaker.shape[-1] != self.speaker_dim:
+                raise ValueError(f"input_speaker dim mismatch: expected {self.speaker_dim}, got {input_speaker.shape[-1]}.")
+            if input_speaker.shape[1] < x.shape[1]:
+                input_speaker = nn.functional.pad(input_speaker, (0, 0, 0, x.shape[1] - input_speaker.shape[1]))
+            input_speaker = input_speaker[:, : x.shape[1], :]
 
         if t.dim() == 0:
             t = t.repeat(x.shape[0])
         c = c + self.t_embedder(t)[:, None, :]
 
         target_mask = self_attn_mask[:, 0, 0, :].bool()
-        x = self.fc_in(torch.cat([x, input_cond, spk_embed], dim=-1))
+        inputs = [x, input_cond]
+        if self.speaker_dim:
+            inputs.append(input_speaker)
+        x = self.fc_in(torch.cat(inputs, dim=-1))
 
         for block in self.blocks:
             x = block(x, c, seq, self.rope, self_attn_mask, cross_attn_mask, cross_q_pos, cross_k_pos)

@@ -3,8 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,7 +10,6 @@ import h5py
 import torch
 import torch.nn.functional as F
 import torchaudio
-import yaml
 from accelerate import PartialState
 from tqdm import tqdm
 
@@ -39,10 +36,10 @@ class LibriTTSItem:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Encode LibriTTS with the ArchiTTS VAE.")
-    parser.add_argument("--architts-root", type=Path, default=Path("../ArchiTTS"))
     parser.add_argument("--libritts-root", type=Path, default=Path("/datasets/LibriTTS"))
     parser.add_argument("--out-root", type=Path, default=Path("/datasets/jimmy/audio_flow_tts_libritts_architts_vae_mean"))
     parser.add_argument("--vae-name", type=str, default="vae_24khz_f1920c64_1.0")
+    parser.add_argument("--vae-ckpt-path", type=Path)
     parser.add_argument(
         "--subsets",
         nargs="+",
@@ -60,46 +57,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_config(value, root):
-    if isinstance(value, dict):
-        return {key: resolve_config(item, root) for key, item in value.items()}
-    if isinstance(value, list):
-        return [resolve_config(item, root) for item in value]
-    if not isinstance(value, str):
-        return value
+def load_architts_vae(vae_ckpt_path: Path | None, vae_name: str, device: torch.device, dtype: torch.dtype):
+    from audio_flow.encoders.audio.architts_vae import ArchiTTSVAE
 
-    def get_path(path: str):
-        cur = root
-        for part in path.split("."):
-            cur = cur[part]
-        return cur
-
-    full_match = re.fullmatch(r"\$\{([^}]+)\}", value)
-    if full_match:
-        return get_path(full_match.group(1))
-    return re.sub(r"\$\{([^}]+)\}", lambda match: str(get_path(match.group(1))), value)
-
-
-def load_architts_vae(architts_root: Path, vae_name: str, device: torch.device, dtype: torch.dtype):
-    sys.path.insert(0, str(architts_root.resolve()))
-    from architts.model.vae.autoencoder import create_autoencoder_from_config
-    from architts.model.vae.pretransform import AutoencoderPretransform
-
-    vae_dir = architts_root / "pretrained_models" / vae_name
-    config_path = vae_dir / "config.yaml"
-    ckpt_path = vae_dir / "model.ckpt"
-    with open(config_path, "r", encoding="utf-8") as f:
-        raw_config = yaml.safe_load(f)
-    config = resolve_config(raw_config, raw_config)
-
-    scale = float(vae_name.split("_")[-1])
-    autoencoder = AutoencoderPretransform(create_autoencoder_from_config(config), scale=scale)
-    state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)["state_dict"]
-    autoencoder.load_state_dict(state_dict)
-    autoencoder.requires_grad_(False).eval().to(device)
+    wrapper = ArchiTTSVAE(ckpt_path=vae_ckpt_path, vae_name=vae_name).to(device)
+    autoencoder = wrapper.model
     if dtype == torch.float16:
         autoencoder.model_half = True
-    return autoencoder, config_path, ckpt_path
+    autoencoder.requires_grad_(False).eval()
+    return autoencoder, wrapper.ckpt_path, wrapper.ckpt_path
 
 
 def split_from_subset(subset: str) -> str:
@@ -283,7 +249,7 @@ def main() -> None:
             f"--item-shard-index must be in [0, {args.item_num_shards}), got {args.item_shard_index}"
         )
     items = items[args.item_shard_index :: args.item_num_shards]
-    model, config_path, ckpt_path = load_architts_vae(args.architts_root, args.vae_name, device, dtype)
+    model, config_path, ckpt_path = load_architts_vae(args.vae_ckpt_path, args.vae_name, device, dtype)
 
     with state.split_between_processes(items) as local_items:
         local_items = list(local_items)
